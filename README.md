@@ -66,10 +66,8 @@ You should ensure that this script runs all the time. The easiest way would be t
 ```bash
 /usr/bin/sudo -u $YOUR_USER \
         /home/$YOUR_USER/$PATH_TO_SCRIPT/aws-dyndns \
-        test.example.com 5 Z148QEXAMPLE8V 30 >> /var/log/aws-dyndns.log 2>&1 &
+        test.example.com 5 Z148QEXAMPLE8V 30 2>&1 | logger -t awsdyndns --id=$$ &
 ```
-
-If the log file grows too large, you may consider to rotate it by [logrotate](http://linux.die.net/man/8/logrotate).
 
 # Sample log output
 
