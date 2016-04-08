@@ -31,16 +31,16 @@ while [ 1 ] ; do
 	NEW_IP="$(curl -sS --max-time 5 https://api.ipify.org)"
 
 	if ! validate_ip "$OLD_IP" ; then
-		echo "[$(date)]: Invalid OLD_IP: $OLD_IP"
+		echo "Invalid OLD_IP: $OLD_IP"
 		continue
 	fi
 	if ! validate_ip "$NEW_IP" ; then
-		echo "[$(date)]: Invalid NEW_IP: $NEW_IP"
+		echo "Invalid NEW_IP: $NEW_IP"
 		continue
 	fi
 
 	if [ "$OLD_IP" == "$NEW_IP" ]; then
-		echo "[$(date)]: No IP change detected: $OLD_IP"
+		echo "No IP change detected: $OLD_IP"
 		continue
 	fi
 
@@ -68,7 +68,7 @@ while [ 1 ] ; do
 	}
 EOF
 
-	echo "[$(date)]: Updating IP to: $NEW_IP ($DNS_FQDN); OLD=$OLD_IP"
+	echo "Updating IP to: $NEW_IP ($DNS_FQDN); OLD=$OLD_IP"
 
 	aws route53 change-resource-record-sets \
 		--hosted-zone-id "$AWS_ZONE_ID" --change-batch "$JSON_CMD"
@@ -77,5 +77,5 @@ EOF
 	# We update at most every 30 seconds.
 	# Enough time for the AWS Route 53 changes to propagate.
 
-	echo "[$(date)]: Done. Request sent to update IP to: $NEW_IP ($DNS_FQDN)"
+	echo "Done. Request sent to update IP to: $NEW_IP ($DNS_FQDN)"
 done
