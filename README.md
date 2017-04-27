@@ -69,6 +69,35 @@ You should ensure that this script runs all the time. The easiest way would be t
         test.example.com 5 Z148QEXAMPLE8V 30 2>&1 | logger -t awsdyndns --id=$$ &
 ```
 
+# Installing aws-dyndns as a systemd service
+Running aws-dyndns as a systemd service will start the service boot, manage logging,
+execute with the least possible permissions, and relaunch on crash.
+
+```bash
+# These commands are relative to the project root. Change directories to get there.
+cd aws-dyndns
+
+# This will launch the default editor, so you can set a configuration.
+# Because this will run as the unprivileged nobody/nogroup user/group we need to pass the AWS credentials.
+editor systemd/aws-dyndns.conf
+
+# The configuration file needs to be readable by root, but we can give it very restrictive permissions to protect our AWS key.
+sudo chown root:root aws-dyndns systemd/aws-dyndns.service systemd/aws-dyndns.conf 
+sudo chmod 600 systemd/aws-dyndns.conf
+
+# Install the executable, configuration, and service
+sudo mv aws-dyndns /usr/local/sbin
+sudo mv systemd/aws-dyndns.conf /etc/
+sudo mv systemd/aws-dyndns.service /etc/systemd/system
+
+# Reload systemd and then start the service.
+sudo systemctl daemon-reload
+sudo systemctl start aws-dyndns
+
+# Check the log to make sure everything started as expected.
+tail -n 20 /var/log/syslog
+```
+
 # Sample log output
 
 ```
