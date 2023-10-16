@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# This script will install from a local git clone or it can be run from
+# Github directly, like this:
+#
+#     BRANCH=master GROUP=famzah && curl -s https://raw.githubusercontent.com/${GROUP}/aws-dyndns/${BRANCH}/install | sudo bash -s ${BRANCH} ${GROUP}
+#
+# Only supply arguments when installing directly from GitHub. Relevant
+# configuration values in the current install are imported from previous
+# installs.
+
+# https://stackoverflow.com/a/246128/185257
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+PROJECT="aws-dyndns"
+
+REPO_DIR=
+download() {
+    if [[ -n "$1" ]] ; then
+        local BRANCH="$1"
+        local GROUP="$2"
+
+        REPO_DIR=$(mktemp -d)
+        pushd "${REPO_DIR}" &>/dev/null
+
+        echo "Downloading project archive..."
+        set -e
+        curl -LJO https://github.com/"${GROUP}"/${PROJECT}/archive/refs/heads/"${BRANCH}".zip
+        set +e
+
+        # Some embedded Linux systems, like EdgeOS, do not seem to deliver with
+        # the capability to easily unpack zip files, so attempt to do it with
+        # Python instead.
+        if ! type unzip &>/dev/null ; then
+            set -e
+            python -c "import zipfile; zipfile.ZipFile('${PROJECT}-${BRANCH}.zip', 'r').extractall('./')"
+            set +e
+        else
+            set -e
+            unzip "${PROJECT}-${BRANCH}.zip"
+            set +e
+        fi
+
+        popd &>/dev/null
+        SCRIPT_DIR="${REPO_DIR}/${PROJECT}-${BRANCH}"
+    fi
+}
+
+systemd() {
+    echo
+    echo "Installing ${PROJECT} systemd unit..."
+    cp "${SCRIPT_DIR}/systemd/${PROJECT}.service" /lib/systemd/system
+    chmod 644 /lib/systemd/system/${PROJECT}.service
+    systemctl daemon-reload
+    systemctl enable ${PROJECT}.service
+    systemctl cat ${PROJECT}.service
+}
+
+script() {
+    echo
+    echo "Installing ${PROJECT} script..."
+    mkdir -p /usr/local/sbin
+    cp "${SCRIPT_DIR}/${PROJECT}" /usr/local/sbin
+    chmod 755 /usr/local/sbin/${PROJECT}
+}
+
+configuration() {
+    echo
+    echo "Installing configuration file..."
+    if [[ -r /etc/${PROJECT}.conf ]]; then
+        echo "Prior configuration found, migrating prior values..."
+        cp "${SCRIPT_DIR}/systemd/${PROJECT}.conf" /tmp
+        while IFS= read -r VAR ; do
+            VAL=$(grep "${VAR}=" /etc/${PROJECT}.conf | cut -d'=' -f2)
+            echo "${VAR}=${VAL}"
+            sed -i "s#${VAR}=.*#${VAR}=${VAL}#" /tmp/${PROJECT}.conf
+        done < <(grep -E '^[_A-Za-z][_A-Za-z0-9]*=' /tmp/${PROJECT}.conf | cut -d'=' -f1)
+        mv /tmp/${PROJECT}.conf /etc/${PROJECT}.conf
+    else
+        cp "${SCRIPT_DIR}/systemd/${PROJECT}.conf" /etc
+    fi
+
+    chmod 644 /etc/${PROJECT}.conf
+}
+
+cleanup() {
+    echo
+    echo "Install Complete"
+    echo "Review /etc/${PROJECT}.conf before starting ${PROJECT} service."
+
+    if [[ -n "${REPO_DIR}" ]] ; then
+        rm -rf "${REPO_DIR}"
+    fi
+}
+
+main() {
+    # If arguments are supplied assume we are pulling the install script from
+    # GitHub. Otherwise we are installing from a local Git clone.
+    if [[ -n "$1" ]] ; then
+        download "$@"
+    fi
+
+    systemd
+    script
+    configuration
+    cleanup
+}
+
+main "$@"

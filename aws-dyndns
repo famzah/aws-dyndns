@@ -1,81 +1,264 @@
 #!/bin/bash
+
 set -u
 
-function usage() {
-	cat >&2 << EOF
+check_system_utility() {
+    local TOOL
+    for TOOL in "$@" ; do
+        if ! type "${TOOL}" &>/dev/null ; then
+            echo "Error: Missing system utility - ${TOOL}"
+            exit 1
+        fi
+    done
+}
+
+env_check() {
+    check_system_utility awk cat curl host grep sleep
+}
+
+env_check_aws_cli() {
+    check_system_utility aws
+}
+
+env_check_aws_curl() {
+    check_system_utility awk curl cut date grep openssl uname uuidgen
+}
+
+usage() {
+    cat >&2 << EOF
 Usage  : $0 DNS_FQDN DNS_TTL AWS_ZONE_ID RECHECK_SECS
 Example: $0 test.example.com 5 Z148QEXAMPLE8V 30
 EOF
-	exit 1
+    exit 1
 }
 
-function validate_ip() {
-	[[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+DNS_FQDN=
+DNS_TTL=
+AWS_ZONE_ID=
+REFRESH_TIME=
+LOG_CMD=
+args() {
+    [[ "$#" -eq 4 ]] || usage
+
+    if [[ -r /etc/aws-dyndns.conf ]]; then
+        . /etc/aws-dyndns.conf
+    fi
+
+    if [[ -z "${LOG_CMD}" ]] ; then
+        LOG_CMD=echo
+    fi
+
+    # Command line arguments override configuration file.
+    DNS_FQDN="$1"; shift
+    DNS_TTL="$1"; shift
+    AWS_ZONE_ID="$1"; shift
+    REFRESH_TIME="$1"; shift
 }
 
-[ "$#" -eq 4 ] || usage
+validate_ip() {
+    [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
 
-DNS_FQDN="$1"; shift
-DNS_TTL="$1"; shift
-AWS_ZONE_ID="$1"; shift
-REFRESH_TIME="$1"; shift
+# https://stackoverflow.com/a/7385197/185257
+hash_hmac_sha256() {
+    local KEY="$1"
+    local DATA="$2"
 
-OLD_IP=""
-TS=0
+    echo -n "${DATA}" | openssl dgst -sha256 -hmac "${KEY}" | cut -d' ' -f2
+}
 
-while [ 1 ] ; do
-	sleep "${TS}s"
-	TS="$REFRESH_TIME" # first run is without a sleep
+# https://stackoverflow.com/a/22369607/185257
+hash_hmac_sha256_keyasbinary() {
+    local KEY="$1"
+    local DATA="$2"
 
-	OLD_IP="$(dig +short "$DNS_FQDN")"
-	NEW_IP="$(curl -sS --max-time 5 https://api.ipify.org)"
+    echo -n "${DATA}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${KEY}" | cut -d' ' -f2
+}
 
-	if ! validate_ip "$OLD_IP" ; then
-		echo "Invalid OLD_IP: $OLD_IP"
-		continue
-	fi
-	if ! validate_ip "$NEW_IP" ; then
-		echo "Invalid NEW_IP: $NEW_IP"
-		continue
-	fi
+aws_via_cli() {
+    env_check_aws_cli
 
-	if [ "$OLD_IP" == "$NEW_IP" ]; then
-		echo "No IP change detected: $OLD_IP"
-		continue
-	fi
+    local AWS_JSON_CMD
 
-	# UPSERT: http://docs.aws.amazon.com/Route53/latest/APIReference/API_ChangeResourceRecordSets.html
-
-	# http://stackoverflow.com/questions/1167746/how-to-assign-a-heredoc-value-to-a-variable-in-bash
-	read -r -d '' JSON_CMD << EOF
-	{
-		"Comment": "DynDNS update",
-		"Changes": [
-			{
-				"Action": "UPSERT",
-				"ResourceRecordSet": {
-					"Name": "$DNS_FQDN.",
-					"Type": "A",
-					"TTL": $DNS_TTL,
-					"ResourceRecords": [
-						{
-							"Value": "$NEW_IP"
-						}
-					]
-				}
-			}
-		]
-	}
+    # UPSERT: http://docs.aws.amazon.com/Route53/latest/APIReference/API_ChangeResourceRecordSets.html
+    # http://stackoverflow.com/questions/1167746/how-to-assign-a-heredoc-value-to-a-variable-in-bash
+    read -r -d '' AWS_JSON_CMD << EOF
+    {
+        "Comment": "DynDNS update",
+	"Changes": [{
+	    "Action": "UPSERT",
+	    "ResourceRecordSet": {
+                "Name": "${DNS_FQDN}",
+                "Type": "A",
+                "TTL": ${DNS_TTL},
+                "ResourceRecords": [{
+                    "Value": "${NEW_IP}"
+		}]
+            }
+        }]
+    }
 EOF
 
-	echo "Updating IP to: $NEW_IP ($DNS_FQDN); OLD=$OLD_IP"
+    ${LOG_CMD} $(aws route53 change-resource-record-sets \
+                     --hosted-zone-id "${AWS_ZONE_ID}" \
+                     --change-batch "${AWS_JSON_CMD}" 2>&1)
+}
 
-	aws route53 change-resource-record-sets \
-		--hosted-zone-id "$AWS_ZONE_ID" --change-batch "$JSON_CMD"
+aws_xml_payload() {
+    local AWS_PAYLOAD="<ChangeResourceRecordSetsRequest xmlns=\"https://${AWS_HOST}/doc/2013-04-01/\">"
+          AWS_PAYLOAD+="<ChangeBatch><Comment>DynDNS Update</Comment><Changes><Change>"
+          AWS_PAYLOAD+="<Action>UPSERT</Action>"
+          AWS_PAYLOAD+="<ResourceRecordSet>"
+          AWS_PAYLOAD+="<Name>${DNS_FQDN}</Name>"
+          AWS_PAYLOAD+="<Type>A</Type>"
+          AWS_PAYLOAD+="<TTL>${DNS_TTL}</TTL>"
+          AWS_PAYLOAD+="<ResourceRecords>"
+          AWS_PAYLOAD+="<ResourceRecord>"
+          AWS_PAYLOAD+="<Value>${NEW_IP}</Value>"
+          AWS_PAYLOAD+="</ResourceRecord>"
+          AWS_PAYLOAD+="</ResourceRecords>"
+          AWS_PAYLOAD+="</ResourceRecordSet>"
+          AWS_PAYLOAD+="</Change></Changes></ChangeBatch>"
+          AWS_PAYLOAD+="</ChangeResourceRecordSetsRequest>"
+    echo "${AWS_PAYLOAD}"
+}
 
-	# XXX: No "get-change" is performed.
-	# We update at most every 30 seconds.
-	# Enough time for the AWS Route 53 changes to propagate.
+aws_xml_payload_hash() {
+    local AWS_PAYLOAD="$1"
+    echo -n "${AWS_PAYLOAD}" | openssl dgst -sha256 | cut -d' ' -f2
+}
 
-	echo "Done. Request sent to update IP to: $NEW_IP ($DNS_FQDN)"
-done
+aws_canonical() {
+    local AWS_PAYLOAD_HASH="$1"
+    local AWS_CANONICAL="POST"$'\n'
+          AWS_CANONICAL+="/2013-04-01/hostedzone/${AWS_ZONE_ID}/rrset/"$'\n'
+          AWS_CANONICAL+=$'\n'
+          AWS_CANONICAL+="host:${AWS_HOST}"$'\n'
+          AWS_CANONICAL+="x-amz-date:${AWS_DATE}"$'\n'
+          AWS_CANONICAL+=$'\n'
+          AWS_CANONICAL+="${AWS_SIGNED_HEADERS}"$'\n'
+          AWS_CANONICAL+="${AWS_PAYLOAD_HASH}"
+    echo "${AWS_CANONICAL}"
+}
+
+aws_canonical_hash() {
+   local AWS_CANONICAL="$1"
+   echo -n "${AWS_CANONICAL}" | openssl dgst -sha256 | cut -d' ' -f2
+}
+
+aws_string_to_sign() {
+    local AWS_CANONICAL_HASH="$1"
+    local AWS_STRING_TO_SIGN="AWS4-HMAC-SHA256"$'\n'
+          AWS_STRING_TO_SIGN+="${AWS_DATE}"$'\n'
+          AWS_STRING_TO_SIGN+="${AWS_SCOPE_DATE}/${AWS_CLIENT_REGION}/${AWS_SERVICE}/aws4_request"$'\n'
+          AWS_STRING_TO_SIGN+="${AWS_CANONICAL_HASH}"
+    echo "${AWS_STRING_TO_SIGN}"
+}
+
+aws_signature() {
+    local AWS_STRING_TO_SIGN="$1"
+    local AWS_DATE_KEY AWS_DATE_REGION_KEY AWS_DATE_REGION_SERVICE_KEY
+    local AWS_SIGNING_KEY AWS_SIGNATURE
+
+    if [[ -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
+        AWS_SECRET_ACCESS_KEY="$(< ~/.aws/credentials grep aws_secret_access_key | cut -d' ' -f 3)"
+    fi
+    AWS_DATE_KEY="$(hash_hmac_sha256 "AWS4${AWS_SECRET_ACCESS_KEY}" "${AWS_SCOPE_DATE}")"
+    AWS_DATE_REGION_KEY="$(hash_hmac_sha256_keyasbinary "${AWS_DATE_KEY}" "${AWS_CLIENT_REGION}")"
+    AWS_DATE_REGION_SERVICE_KEY="$(hash_hmac_sha256_keyasbinary "${AWS_DATE_REGION_KEY}" "${AWS_SERVICE}")"
+    AWS_SIGNING_KEY="$(hash_hmac_sha256_keyasbinary "${AWS_DATE_REGION_SERVICE_KEY}" 'aws4_request')"
+    AWS_SIGNATURE="$(hash_hmac_sha256_keyasbinary "${AWS_SIGNING_KEY}" "${AWS_STRING_TO_SIGN}")"
+
+    echo "${AWS_SIGNATURE}"
+}
+
+AWS_DATE=
+AWS_DATE_KEY=
+AWS_SERVICE="route53"
+AWS_CLIENT_REGION="us-east-1"
+AWS_HOST="${AWS_SERVICE}.amazonaws.com"
+AWS_SIGNED_HEADERS="host;x-amz-date"
+aws_via_curl() {
+    env_check_aws_curl
+
+    local AWS_PAYLOAD AWS_PAYLOAD_HASH AWS_CANONICAL AWS_URL HEADERS
+    local AWS_CANONICAL_HASH AWS_STRING_TO_SIGN AWS_SIGNATURE AWS_CREDENTIAL
+
+    AWS_DATE="$(date -u +"%Y%m%dT%H%M%SZ")"
+    AWS_SCOPE_DATE="$(echo -n "${AWS_DATE}" | cut -d'T' -f1)"
+    AWS_PAYLOAD="$(aws_xml_payload)"
+    AWS_PAYLOAD_HASH="$(aws_xml_payload_hash "${AWS_PAYLOAD}")"
+    AWS_CANONICAL="$(aws_canonical "${AWS_PAYLOAD_HASH}")"
+    AWS_CANONICAL_HASH="$(aws_canonical_hash "${AWS_CANONICAL}")"
+    AWS_STRING_TO_SIGN="$(aws_string_to_sign "${AWS_CANONICAL_HASH}")"
+    AWS_SIGNATURE="$(aws_signature "${AWS_STRING_TO_SIGN}")"
+
+    if [[ -z "${AWS_ACCESS_KEY_ID}" ]]; then
+        AWS_ACCESS_KEY_ID="$(< ~/.aws/credentials grep aws_access_key_id | cut -d' ' -f 3)"
+    fi
+    AWS_CREDENTIAL="${AWS_ACCESS_KEY_ID}/${AWS_SCOPE_DATE}/${AWS_CLIENT_REGION}/${AWS_SERVICE}/aws4_request"
+    AWS_URL="https://${AWS_HOST}/2013-04-01/hostedzone/${AWS_ZONE_ID}/rrset/"
+
+    HEADERS=()
+    HEADERS+=("-H" "User-Agent: bash/${BASH_VERSION} $(uname -s)/$(uname -r) OpenSSL/$(openssl version | awk '{print $2}')")
+    HEADERS+=("-H" "X-Amz-Date: ${AWS_DATE}")
+    HEADERS+=("-H" "Authorization: AWS4-HMAC-SHA256 Credential=${AWS_CREDENTIAL}, SignedHeaders=${AWS_SIGNED_HEADERS}, Signature=${AWS_SIGNATURE}")
+    HEADERS+=("-H" "amz-sdk-invocation-id: $(uuidgen --random)")
+    HEADERS+=("-H" "amz-sdk-request: attempt=1")
+
+    ${LOG_CMD} $(curl -Ss --data "${AWS_PAYLOAD}" "${HEADERS[@]}" -X POST "${AWS_URL}" 2>&1)
+}
+
+OLD_IP=
+NEW_IP=
+TS=0
+poll() {
+    while (( 1 )) ; do
+        sleep "${TS}s"
+        TS="${REFRESH_TIME}" # first run is without a sleep
+
+        if type dig &>/dev/null ; then
+            OLD_IP="$(dig +short "${DNS_FQDN}")"
+        else
+            OLD_IP="$(host -t A "${DNS_FQDN}" | grep "has.*address" | awk '{print $NF}')"
+        fi
+        NEW_IP="$(curl -sS --max-time 5 https://api.ipify.org)"
+
+        ${LOG_CMD} ""
+        if [[ -z "${NEW_IP}" ]]; then
+            ${LOG_CMD} "Unable to determine NEW_IP."
+            continue
+        fi
+
+        if [[ -n "${OLD_IP}" ]] && ! validate_ip "${OLD_IP}" ; then
+	        ${LOG_CMD} "Invalid OLD_IP: ${OLD_IP}"
+	        continue
+	    fi
+        
+	    if ! validate_ip "${NEW_IP}" ; then
+	        ${LOG_CMD} "Invalid NEW_IP: ${NEW_IP}"
+	        continue
+	    fi
+
+	    if [[ -n "${OLD_IP}" && "${OLD_IP}" == "${NEW_IP}" ]]; then
+	        ${LOG_CMD} "No IP change detected: ${OLD_IP}"
+	        continue
+	    fi
+
+        ${LOG_CMD} "Updating IP to: ${NEW_IP} (${DNS_FQDN}); OLD=${OLD_IP}"
+
+        if type aws &> /dev/null ; then
+            aws_via_cli
+        else
+            aws_via_curl
+        fi
+    done
+}
+
+main() {
+    args "$@"
+    env_check
+    poll
+}
+
+main "$@"
